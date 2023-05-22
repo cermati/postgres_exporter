@@ -90,11 +90,12 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 	}
 
 	// Figure out the database the client is connected to, which will be used as
-	// server metric label to differenentiate metrics that originate from
-	// different database.
+	// server metric label to uniquely label metrics originating from different
+	// databases.
 	//
 	// We need this as parseFingerprint() (used in serverConstLabels) may return
-	// the same value for different DSNs if they have the same host and port.
+	// the same value for different DSNs if the only part that's different between
+	// them is the database name.
 	databaseName, err := getConnectedDatabaseName(db)
 	if err != nil {
 		return nil, fmt.Errorf("error getting database name: %w", err)
