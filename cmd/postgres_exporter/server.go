@@ -43,6 +43,9 @@ type Server struct {
 	// Currently cached metrics
 	metricCache map[string]cachedMetrics
 	cacheMtx    sync.Mutex
+
+	// Metrics about the server
+	metrics *ServerMetrics
 }
 
 // ServerOpt configures a server.
@@ -54,6 +57,15 @@ func ServerWithLabels(labels prometheus.Labels) ServerOpt {
 		for k, v := range labels {
 			s.labels[k] = v
 		}
+	}
+}
+
+// ServerWithMaxSQLConns configures the maximum number of connections the SQL
+// client can make
+func ServerWithMaxSQLConns(maxOpenConn int, maxIdleConns int) ServerOpt {
+	return func(s *Server) {
+		s.db.SetMaxOpenConns(maxOpenConn)
+		s.db.SetMaxIdleConns(maxIdleConns)
 	}
 }
 
@@ -73,13 +85,32 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 
 	level.Info(logger).Log("msg", "Established new database connection", "fingerprint", fingerprint)
 
+	serverConstLabels := prometheus.Labels{
+		serverLabelName: fingerprint,
+	}
+
+	// Figure out the database the client is connected to, which will be used as
+	// server metric label to differenentiate metrics that originate from
+	// different database.
+	//
+	// We need this as parseFingerprint() (used in serverConstLabels) may return
+	// the same value for different DSNs if they have the same host and port.
+	databaseName, err := getConnectedDatabaseName(db)
+	if err != nil {
+		return nil, fmt.Errorf("error getting database name: %w", err)
+	}
+
+	metrics, err := NewServerMetrics(databaseName, serverConstLabels)
+	if err != nil {
+		return nil, fmt.Errorf("error creating server metrics: %w", err)
+	}
+
 	s := &Server{
-		db:     db,
-		master: false,
-		labels: prometheus.Labels{
-			serverLabelName: fingerprint,
-		},
+		db:          db,
+		master:      false,
+		labels:      serverConstLabels,
 		metricCache: make(map[string]cachedMetrics),
+		metrics:     metrics,
 	}
 
 	for _, opt := range opts {
@@ -127,6 +158,8 @@ func (s *Server) Scrape(ch chan<- prometheus.Metric, disableSettingsMetrics bool
 	if len(errMap) > 0 {
 		err = fmt.Errorf("queryNamespaceMappings returned %d errors", len(errMap))
 	}
+
+	s.metrics.Collect(ch)
 
 	return err
 }
@@ -187,4 +220,17 @@ func (s *Servers) Close() {
 			level.Error(logger).Log("msg", "Failed to close connection", "server", server, "err", err)
 		}
 	}
+}
+
+// Executes the current_database() query to obtain the database the client is
+// currently connected to
+func getConnectedDatabaseName(db *sql.DB) (string, error) {
+	var datname string
+
+	rows := db.QueryRow(`SELECT current_database()`)
+	if err := rows.Scan(&datname); err != nil {
+		return "", err
+	}
+
+	return datname, nil
 }

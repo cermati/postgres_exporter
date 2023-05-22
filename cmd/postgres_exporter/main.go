@@ -50,6 +50,8 @@ var (
 	excludeDatabases       = kingpin.Flag("exclude-databases", "A list of databases to remove when autoDiscoverDatabases is enabled").Default("").Envar("PG_EXPORTER_EXCLUDE_DATABASES").String()
 	includeDatabases       = kingpin.Flag("include-databases", "A list of databases to include when autoDiscoverDatabases is enabled").Default("").Envar("PG_EXPORTER_INCLUDE_DATABASES").String()
 	metricPrefix           = kingpin.Flag("metric-prefix", "A metric prefix can be used to have non-default (not \"pg\") prefixes for each of the metrics").Default("pg").Envar("PG_EXPORTER_METRIC_PREFIX").String()
+	maxOpenConns           = kingpin.Flag("max-open-conns", "Maximum number of open connections to each database in server.").Default("1").Envar("PG_EXPORTER_MAX_OPEN_CONNS").Int()
+	maxIdleConns           = kingpin.Flag("max-idle-conns", "Maximum number of connections in the idle connection pool for each database in server.").Default("1").Envar("PG_EXPORTER_MAX_IDLE_CONNS").Int()
 	logger                 = log.NewNopLogger()
 )
 
@@ -95,7 +97,7 @@ func main() {
 	excludedDatabases := strings.Split(*excludeDatabases, ",")
 	logger.Log("msg", "Excluded databases", "databases", fmt.Sprintf("%v", excludedDatabases))
 
-	opts := []ExporterOpt{
+	exporterOpts := []ExporterOpt{
 		DisableDefaultMetrics(*disableDefaultMetrics),
 		DisableSettingsMetrics(*disableSettingsMetrics),
 		AutoDiscoverDatabases(*autoDiscoverDatabases),
@@ -105,7 +107,11 @@ func main() {
 		IncludeDatabases(*includeDatabases),
 	}
 
-	exporter := NewExporter(dsns, opts...)
+	serverOpts := []ServerOpt{
+		ServerWithMaxSQLConns(*maxOpenConns, *maxIdleConns),
+	}
+
+	exporter := NewExporterWithServerOptions(dsns, exporterOpts, serverOpts)
 	defer func() {
 		exporter.servers.Close()
 	}()

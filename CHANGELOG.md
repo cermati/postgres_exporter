@@ -1,5 +1,9 @@
 ## master / unreleased
 
+## 0.12.0-cermati.0 / 2023-05-22
+* [FEATURE] Add `--max-open-conns` and `--max-idle-conns` options, allowing the exporter to execute metric queries concurrently if set to a number greater than 1
+* [FEATURE] Add `pg_exporter_metric_query_last_duration_seconds` and `pg_exporter_metric_query_errors_total` metrics, which describes the last execution duration of metric queries and the number of query errors that have happened so far, respectively. The metrics cover custom user queries (specified with `--extend.query-path`) as well as the default metrics (`--no-disable-default-metrics` and `--no-disable-settings-metrics`).
+
 ## 0.12.0 / 2023-03-21
 
 BREAKING CHANGES:
