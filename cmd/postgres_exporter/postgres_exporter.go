@@ -22,6 +22,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/blang/semver/v4"
@@ -541,17 +542,33 @@ func parseConstLabels(s string) prometheus.Labels {
 
 // NewExporter returns a new PostgreSQL exporter for the provided DSN.
 func NewExporter(dsn []string, opts ...ExporterOpt) *Exporter {
+	return NewExporterWithServerOptions(dsn, opts, nil)
+}
+
+// NewExporterWithServerOptions returns a new PostgreSQL exporter for the
+// provided DSN, with additional options for the PostgreSQL server connections
+func NewExporterWithServerOptions(
+	dsn []string,
+	exporterOpts []ExporterOpt,
+	serverOpts []ServerOpt,
+) *Exporter {
 	e := &Exporter{
 		dsn:               dsn,
 		builtinMetricMaps: builtinMetricMaps,
 	}
 
-	for _, opt := range opts {
+	for _, opt := range exporterOpts {
 		opt(e)
 	}
 
+	serverOptsWithDefaults := []ServerOpt{
+		ServerWithLabels(e.constantLabels),
+	}
+
+	serverOptsWithDefaults = append(serverOptsWithDefaults, serverOpts...)
+
 	e.setupInternalMetrics()
-	e.servers = NewServers(ServerWithLabels(e.constantLabels))
+	e.servers = NewServers(serverOptsWithDefaults...)
 
 	return e
 }
@@ -708,18 +725,32 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 	var errorsCount int
 	var connectionErrorsCount int
+	errorsCountMu := new(sync.Mutex)
+
+	wg := new(sync.WaitGroup)
 
 	for _, dsn := range dsns {
-		if err := e.scrapeDSN(ch, dsn); err != nil {
-			errorsCount++
+		wg.Add(1)
 
-			level.Error(logger).Log("err", err)
+		go func(dsn string) {
+			defer wg.Done()
 
-			if _, ok := err.(*ErrorConnectToServer); ok {
-				connectionErrorsCount++
+			if err := e.scrapeDSN(ch, dsn); err != nil {
+				errorsCountMu.Lock()
+				defer errorsCountMu.Unlock()
+
+				errorsCount++
+
+				level.Error(logger).Log("err", err)
+
+				if _, ok := err.(*ErrorConnectToServer); ok {
+					connectionErrorsCount++
+				}
 			}
-		}
+		}(dsn)
 	}
+
+	wg.Wait()
 
 	switch {
 	case connectionErrorsCount >= len(dsns):

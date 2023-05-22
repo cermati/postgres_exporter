@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/blang/semver/v4"
@@ -187,78 +188,118 @@ func queryNamespaceMappings(ch chan<- prometheus.Metric, server *Server) map[str
 	// Return a map of namespace -> errors
 	namespaceErrors := make(map[string]error)
 
+	type namespaceErrorTuple struct {
+		Namespace string
+		Err       error
+	}
+
+	namespaceErrorsCh := make(chan namespaceErrorTuple)
+	namespaceErrorsWg := new(sync.WaitGroup)
+
+	namespaceErrorsWg.Add(1)
+	go func() {
+		defer namespaceErrorsWg.Done()
+
+		for {
+			nsErr, ok := <-namespaceErrorsCh
+			if !ok {
+				return
+			}
+
+			namespaceErrors[nsErr.Namespace] = nsErr.Err
+		}
+	}()
+
 	scrapeStart := time.Now()
 
+	scrapeWg := new(sync.WaitGroup)
 	for namespace, mapping := range server.metricMap {
-		level.Debug(logger).Log("msg", "Querying namespace", "namespace", namespace)
+		scrapeWg.Add(1)
 
-		if mapping.master && !server.master {
-			level.Debug(logger).Log("msg", "Query skipped...")
-			continue
-		}
+		go func(namespace string, mapping MetricMapNamespace) {
+			defer scrapeWg.Done()
 
-		// check if the query is to be run on specific database server version range or not
-		if len(server.runonserver) > 0 {
-			serVersion, _ := semver.Parse(server.lastMapVersion.String())
-			runServerRange, _ := semver.ParseRange(server.runonserver)
-			if !runServerRange(serVersion) {
-				level.Debug(logger).Log("msg", "Query skipped for this database version", "version", server.lastMapVersion.String(), "target_version", server.runonserver)
-				continue
+			level.Debug(logger).Log("msg", "Querying namespace", "namespace", namespace)
+
+			if mapping.master && !server.master {
+				level.Debug(logger).Log("msg", "Query skipped...")
+				return
 			}
-		}
 
-		scrapeMetric := false
-		// Check if the metric is cached
-		server.cacheMtx.Lock()
-		cachedMetric, found := server.metricCache[namespace]
-		server.cacheMtx.Unlock()
-		// If found, check if needs refresh from cache
-		if found {
-			if scrapeStart.Sub(cachedMetric.lastScrape).Seconds() > float64(mapping.cacheSeconds) {
+			// check if the query is to be run on specific database server version range or not
+			if len(server.runonserver) > 0 {
+				serVersion, _ := semver.Parse(server.lastMapVersion.String())
+				runServerRange, _ := semver.ParseRange(server.runonserver)
+				if !runServerRange(serVersion) {
+					level.Debug(logger).Log("msg", "Query skipped for this database version", "version", server.lastMapVersion.String(), "target_version", server.runonserver)
+					return
+				}
+			}
+
+			scrapeMetric := false
+			// Check if the metric is cached
+			server.cacheMtx.Lock()
+			cachedMetric, found := server.metricCache[namespace]
+			server.cacheMtx.Unlock()
+			// If found, check if needs refresh from cache
+			if found {
+				if scrapeStart.Sub(cachedMetric.lastScrape).Seconds() > float64(mapping.cacheSeconds) {
+					scrapeMetric = true
+				}
+			} else {
 				scrapeMetric = true
 			}
-		} else {
-			scrapeMetric = true
-		}
 
-		var metrics []prometheus.Metric
-		var nonFatalErrors []error
-		var err error
-		if scrapeMetric {
-			metrics, nonFatalErrors, err = queryNamespaceMapping(server, namespace, mapping)
-		} else {
-			metrics = cachedMetric.metrics
-		}
+			var metrics []prometheus.Metric
+			var nonFatalErrors []error
+			var err error
 
-		// Serious error - a namespace disappeared
-		if err != nil {
-			namespaceErrors[namespace] = err
-			level.Info(logger).Log("err", err)
-		}
-		// Non-serious errors - likely version or parsing problems.
-		if len(nonFatalErrors) > 0 {
-			for _, err := range nonFatalErrors {
-				level.Info(logger).Log("err", err)
+			queryStart := time.Now()
+
+			if scrapeMetric {
+				metrics, nonFatalErrors, err = queryNamespaceMapping(server, namespace, mapping)
+			} else {
+				metrics = cachedMetric.metrics
 			}
-		}
 
-		// Emit the metrics into the channel
-		for _, metric := range metrics {
-			ch <- metric
-		}
+			server.metrics.RecordMetricQueryExecution(namespace, time.Since(queryStart), err)
 
-		if scrapeMetric {
-			// Only cache if metric is meaningfully cacheable
-			if mapping.cacheSeconds > 0 {
-				server.cacheMtx.Lock()
-				server.metricCache[namespace] = cachedMetrics{
-					metrics:    metrics,
-					lastScrape: scrapeStart,
+			// Serious error - a namespace disappeared
+			if err != nil {
+				namespaceErrorsCh <- namespaceErrorTuple{namespace, err}
+				level.Error(logger).Log("err", err)
+			}
+
+			// Non-serious errors - likely version or parsing problems.
+			if len(nonFatalErrors) > 0 {
+				for _, err := range nonFatalErrors {
+					level.Warn(logger).Log("err", err)
 				}
-				server.cacheMtx.Unlock()
 			}
-		}
+
+			// Emit the metrics into the channel
+			for _, metric := range metrics {
+				ch <- metric
+			}
+
+			if scrapeMetric {
+				// Only cache if metric is meaningfully cacheable
+				if mapping.cacheSeconds > 0 {
+					server.cacheMtx.Lock()
+					server.metricCache[namespace] = cachedMetrics{
+						metrics:    metrics,
+						lastScrape: scrapeStart,
+					}
+					server.cacheMtx.Unlock()
+				}
+			}
+		}(namespace, mapping)
 	}
+
+	scrapeWg.Wait()
+
+	close(namespaceErrorsCh)
+	namespaceErrorsWg.Wait()
 
 	return namespaceErrors
 }
